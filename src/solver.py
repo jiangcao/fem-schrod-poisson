@@ -95,9 +95,11 @@ def solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=None):
         - None (default): constant epsilon=1.0 (standard Laplace)
         - float: constant scalar epsilon
         - array of shape (ndofs,): spatially varying scalar epsilon at DOFs
-        - array of shape (3, 3, nqp) or (ndofs, 3, 3): tensor epsilon
+        - array of shape (ndofs, 3, 3): tensor epsilon at DOFs
         - callable(X) -> scalar array or tensor array: function of coordinates
-          where X has shape (3, ndofs) or (3, nqp)
+          where X has shape (3, npts) and returns either:
+            * 1D array of shape (npts,) for scalar epsilon
+            * 3D array of shape (3, 3, npts) for tensor epsilon
     
     Returns:
     --------
@@ -117,8 +119,11 @@ def solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=None):
         A = epsilon * asm(laplace, basis).tocsr()
     elif callable(epsilon):
         # Epsilon is a callable function
-        eps_vals = epsilon(basis.doflocs)
-        if eps_vals.ndim == 1:
+        # Evaluate once to check dimensionality (returns scalar or tensor)
+        # Note: We must evaluate epsilon again inside the form at quadrature points,
+        # so this initial call is just for determining the return type
+        eps_check = epsilon(basis.doflocs)
+        if eps_check.ndim == 1:
             # Scalar field: -∇·(ε∇φ)
             def weighted_laplace(u, v, w):
                 # w.x has shape (3, nelems, nqp)
@@ -168,12 +173,15 @@ def solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=None):
             if epsilon.shape[0] == basis.N and epsilon.shape[1:] == (3, 3):
                 # Epsilon given at DOFs: shape (ndofs, 3, 3)
                 # Interpolate each component separately
-                # Use a dummy interpolation to get the shape
-                dummy_interp = basis.interpolate(np.ones(basis.N))
-                nqp_per_elem = dummy_interp.shape[1]
-                eps_tensor_qp = np.zeros((3, 3, basis.nelems, nqp_per_elem))
+                # Interpolate one component to get the shape, then allocate array
+                eps_00 = basis.interpolate(epsilon[:, 0, 0])
+                eps_tensor_qp = np.zeros((3, 3) + eps_00.shape)
+                eps_tensor_qp[0, 0] = eps_00
+                # Interpolate remaining components
                 for i in range(3):
                     for j in range(3):
+                        if i == 0 and j == 0:
+                            continue  # Already done
                         eps_tensor_qp[i, j] = basis.interpolate(epsilon[:, i, j])
                 
                 def tensor_laplace(u, v, w):
