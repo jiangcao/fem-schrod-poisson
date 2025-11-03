@@ -1,2 +1,4 @@
 .venv
-*.pycmesh.msh
+*.pyc
+__pycache__/
+mesh.msh
