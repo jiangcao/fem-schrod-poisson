@@ -106,46 +106,6 @@ def solve_poisson(mesh, basis, rho, bc_value=0.0):
     phi[interior] = phi_i
     return phi
 
-def scf_loop(mesh, basis, K, M, Vext_func, coupling=1.0, maxiter=50, tol=1e-6, mix=0.3, nev=4, verbose=True):
-    """
-    Self-consistent loop with simple linear mixing of Hartree potential.
-    - Vext_func(X) -> external potential at DOFs
-    - mix: mixing parameter for new_potential = (1-mix)*old + mix*new
-    Diagnostics printed each iteration when verbose=True.
-    """
-    ndofs = basis.N
-    X = basis.doflocs
-    Vext_vec = Vext_func(X)
-    V_old = Vext_vec.copy()
-    prev_energy = None
-
-    for it in range(1, maxiter + 1):
-        # assemble and solve eigenproblem with current potential
-        E, modes = solve_generalized_eig(K, M, V_old, nev=nev, which='SM')
-        modes = normalize_modes(modes, M)
-        psi0 = modes[:, 0]
-        rho = np.abs(psi0)**2
-
-        # solve Poisson for Hartree potential (phi)
-        phi = solve_poisson(mesh, basis, rho, bc_value=0.0)
-
-        # build new potential vector and mix
-        V_new = Vext_vec + coupling * phi
-        V_mixed = (1.0 - mix) * V_old + mix * V_new
-        # diagnostics
-        total_energy = E[0]
-        dens_change = np.linalg.norm(rho - (M.dot(psi0**2) if False else rho))  # placeholder for density metric
-        pot_change = np.linalg.norm(V_mixed - V_old) / (1.0 + np.linalg.norm(V_old))
-        if verbose:
-            print(f"SCF it {it:3d}: E0 = {total_energy:.8e}, |ΔV|={pot_change:.3e}, mix={mix:.3f}")
-        if prev_energy is not None and abs(total_energy - prev_energy) < tol and pot_change < tol:
-            if verbose:
-                print("SCF converged")
-            V_old = V_mixed
-            break
-        V_old = V_mixed
-        prev_energy = total_energy
-    return E, modes, phi, V_old
 
 
 
