@@ -82,16 +82,16 @@ def test_poisson_spatially_varying_scalar_epsilon_callable():
     """Test Poisson solver with spatially varying scalar epsilon as callable."""
     mesh = solver.make_mesh_box(x0=(0,0,0), lengths=(1.0,1.0,1.0), char_length=0.4, verbose=False)
     mesh, basis, K, M = solver.assemble_operators(mesh)
-
+    
     rho = np.ones(basis.N)
-
+    
     # Define epsilon as a callable
     def epsilon_func(X):
         # X has shape (3, npts)
         return 1.0 + 0.5 * X[0, :]  # varies along x-axis
-
+    
     phi = solver.solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=epsilon_func)
-
+    
     assert np.all(np.isfinite(phi))
     assert phi.shape[0] == basis.N
 
@@ -99,9 +99,9 @@ def test_poisson_tensor_epsilon_callable_diagonal():
     """Test Poisson solver with diagonal tensor epsilon as callable."""
     mesh = solver.make_mesh_box(x0=(0,0,0), lengths=(1.0,1.0,1.0), char_length=0.4, verbose=False)
     mesh, basis, K, M = solver.assemble_operators(mesh)
-
+    
     rho = np.ones(basis.N)
-
+    
     # Define anisotropic epsilon (diagonal tensor)
     def epsilon_tensor(X):
         # X has shape (3, npts)
@@ -111,9 +111,9 @@ def test_poisson_tensor_epsilon_callable_diagonal():
         eps[1, 1, :] = 1.0  # y-direction
         eps[2, 2, :] = 0.5  # z-direction
         return eps
-
+    
     phi = solver.solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=epsilon_tensor)
-
+    
     assert np.all(np.isfinite(phi))
     assert phi.shape[0] == basis.N
 
@@ -121,9 +121,9 @@ def test_poisson_tensor_epsilon_callable_anisotropic():
     """Test Poisson solver with full anisotropic tensor epsilon."""
     mesh = solver.make_mesh_box(x0=(0,0,0), lengths=(1.0,1.0,1.0), char_length=0.4, verbose=False)
     mesh, basis, K, M = solver.assemble_operators(mesh)
-
+    
     rho = np.ones(basis.N)
-
+    
     # Define anisotropic epsilon with off-diagonal terms
     def epsilon_tensor(X):
         # X has shape (3, npts)
@@ -139,9 +139,9 @@ def test_poisson_tensor_epsilon_callable_anisotropic():
         eps[1, 2, :] = 0.2
         eps[2, 1, :] = 0.2
         return eps
-
+    
     phi = solver.solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=epsilon_tensor)
-
+    
     assert np.all(np.isfinite(phi))
     assert phi.shape[0] == basis.N
 
@@ -149,10 +149,10 @@ def test_poisson_tensor_epsilon_array_at_dofs():
     """Test Poisson solver with tensor epsilon given as array at DOFs."""
     mesh = solver.make_mesh_box(x0=(0,0,0), lengths=(1.0,1.0,1.0), char_length=0.4, verbose=False)
     mesh, basis, K, M = solver.assemble_operators(mesh)
-
+    
     rho = np.ones(basis.N)
     X = basis.doflocs
-
+    
     # Create spatially varying tensor epsilon at DOFs
     epsilon = np.zeros((basis.N, 3, 3))
     for i in range(basis.N):
@@ -160,9 +160,9 @@ def test_poisson_tensor_epsilon_array_at_dofs():
         epsilon[i, 0, 0] = 1.0 + 0.5 * X[0, i]  # x-direction varies with x
         epsilon[i, 1, 1] = 1.0 + 0.5 * X[1, i]  # y-direction varies with y
         epsilon[i, 2, 2] = 1.0 + 0.5 * X[2, i]  # z-direction varies with z
-
+    
     phi = solver.solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=epsilon)
-
+    
     assert np.all(np.isfinite(phi))
     assert phi.shape[0] == basis.N
 
@@ -170,24 +170,24 @@ def test_poisson_comparison_scalar_vs_isotropic_tensor():
     """Compare scalar epsilon with isotropic tensor epsilon - should give same result."""
     mesh = solver.make_mesh_box(x0=(0,0,0), lengths=(1.0,1.0,1.0), char_length=0.4, verbose=False)
     mesh, basis, K, M = solver.assemble_operators(mesh)
-
+    
     rho = np.ones(basis.N)
-
+    
     # Solve with scalar epsilon
     eps_scalar = 2.5
     phi_scalar = solver.solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=eps_scalar)
-
+    
     # Solve with isotropic tensor epsilon
     def epsilon_tensor(X):
         npts = X.shape[1]
         eps = np.zeros((3, 3, npts))
-        eps[0, 0, :] = eps_scalar;
-        eps[1, 1, :] = eps_scalar;
-        eps[2, 2, :] = eps_scalar;
+        eps[0, 0, :] = eps_scalar
+        eps[1, 1, :] = eps_scalar
+        eps[2, 2, :] = eps_scalar
         return eps
-
+    
     phi_tensor = solver.solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=epsilon_tensor)
-
+    
     # Should be very close
     assert np.allclose(phi_scalar, phi_tensor, rtol=1e-8, atol=1e-10)
 
@@ -196,7 +196,7 @@ def test_poisson_with_scf_integration():
     mesh = solver.make_mesh_box(x0=(0,0,0), lengths=(1.0,1.0,1.0), char_length=0.45, verbose=False)
     mesh, basis, K, M = solver.assemble_operators(mesh)
     Vext = lambda X: np.zeros(X.shape[1])
-
+    
     # Run a short SCF loop with default epsilon
     E, modes, phi, Vfinal = solver.scf_loop(mesh, basis, K, M, Vext,
                                            coupling=1.0, maxiter=10, tol=1e-5,
