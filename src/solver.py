@@ -76,16 +76,127 @@ def normalize_modes(psi, M):
     norms = np.sqrt(np.abs(np.sum(psi * (M.dot(psi)), axis=0)))
     return psi / norms
 
-def solve_poisson(mesh, basis, rho, bc_value=0.0):
+def solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=None):
     """
-    Solve -Δφ = rho with Dirichlet bc=bc_value on boundary nodes.
-    rho: array length ndofs (density given at DOFs)
-    Returns phi at DOFs.
+    Solve -∇·(ε∇φ) = rho with Dirichlet bc=bc_value on boundary nodes.
+    
+    Parameters:
+    -----------
+    mesh : skfem.Mesh
+        The mesh
+    basis : skfem.Basis
+        The basis functions
+    rho : array length ndofs
+        Source term (density given at DOFs)
+    bc_value : float, optional
+        Dirichlet boundary condition value (default 0.0)
+    epsilon : None, float, array, or callable, optional
+        Spatially varying permittivity/diffusion coefficient:
+        - None (default): constant epsilon=1.0 (standard Laplace)
+        - float: constant scalar epsilon
+        - array of shape (ndofs,): spatially varying scalar epsilon at DOFs
+        - array of shape (3, 3, nqp) or (ndofs, 3, 3): tensor epsilon
+        - callable(X) -> scalar array or tensor array: function of coordinates
+          where X has shape (3, ndofs) or (3, nqp)
+    
+    Returns:
+    --------
+    phi : array length ndofs
+        Solution at DOFs
     """
-    A = asm(laplace, basis).tocsr()
     def mass(u, v, w):
         return u * v
     M = asm(mass, basis).tocsr()
+    
+    # Assemble stiffness matrix based on epsilon
+    if epsilon is None:
+        # Standard Laplace operator: -Δφ
+        A = asm(laplace, basis).tocsr()
+    elif np.isscalar(epsilon):
+        # Constant scalar epsilon: -ε∇²φ
+        A = epsilon * asm(laplace, basis).tocsr()
+    elif callable(epsilon):
+        # Epsilon is a callable function
+        eps_vals = epsilon(basis.doflocs)
+        if eps_vals.ndim == 1:
+            # Scalar field: -∇·(ε∇φ)
+            def weighted_laplace(u, v, w):
+                # w.x has shape (3, nelems, nqp)
+                # Reshape to (3, nelems*nqp) for epsilon function
+                x_flat = w.x.reshape(3, -1)
+                eps_qp = epsilon(x_flat)  # Returns shape (nelems*nqp,)
+                # Reshape back to (nelems, nqp)
+                eps_qp = eps_qp.reshape(u.grad[0].shape)
+                return eps_qp * (u.grad[0] * v.grad[0] + 
+                                 u.grad[1] * v.grad[1] + 
+                                 u.grad[2] * v.grad[2])
+            A = asm(weighted_laplace, basis).tocsr()
+        else:
+            # Tensor field: -∇·(ε·∇φ)
+            def tensor_laplace(u, v, w):
+                # w.x has shape (3, nelems, nqp)
+                # Reshape to (3, nelems*nqp) for epsilon function
+                x_flat = w.x.reshape(3, -1)
+                eps_tensor = epsilon(x_flat)  # Returns shape (3, 3, nelems*nqp)
+                # Reshape to (3, 3, nelems, nqp)
+                eps_tensor = eps_tensor.reshape(3, 3, *u.grad[0].shape)
+                # Compute ε·∇u
+                eps_grad_u = np.zeros((3,) + u.grad[0].shape)
+                for i in range(3):
+                    for j in range(3):
+                        eps_grad_u[i] += eps_tensor[i, j] * u.grad[j]
+                # Compute ∇v · (ε·∇u)
+                return (eps_grad_u[0] * v.grad[0] + 
+                        eps_grad_u[1] * v.grad[1] + 
+                        eps_grad_u[2] * v.grad[2])
+            A = asm(tensor_laplace, basis).tocsr()
+    elif isinstance(epsilon, np.ndarray):
+        if epsilon.ndim == 1:
+            # Array of scalar values at DOFs
+            if len(epsilon) != basis.N:
+                raise ValueError(f"Epsilon array length {len(epsilon)} must match ndofs {basis.N}")
+            # Interpolate to quadrature points
+            eps_qp = basis.interpolate(epsilon)  # shape (nelems, nqp)
+            
+            def weighted_laplace(u, v, w):
+                return eps_qp * (u.grad[0] * v.grad[0] + 
+                                 u.grad[1] * v.grad[1] + 
+                                 u.grad[2] * v.grad[2])
+            A = asm(weighted_laplace, basis).tocsr()
+        elif epsilon.ndim == 3:
+            # Tensor epsilon at DOFs
+            if epsilon.shape[0] == basis.N and epsilon.shape[1:] == (3, 3):
+                # Epsilon given at DOFs: shape (ndofs, 3, 3)
+                # Interpolate each component separately
+                # Use a dummy interpolation to get the shape
+                dummy_interp = basis.interpolate(np.ones(basis.N))
+                nqp_per_elem = dummy_interp.shape[1]
+                eps_tensor_qp = np.zeros((3, 3, basis.nelems, nqp_per_elem))
+                for i in range(3):
+                    for j in range(3):
+                        eps_tensor_qp[i, j] = basis.interpolate(epsilon[:, i, j])
+                
+                def tensor_laplace(u, v, w):
+                    # eps_tensor_qp has shape (3, 3, nelems, nqp)
+                    # Compute ε·∇u
+                    eps_grad_u = np.zeros((3,) + u.grad[0].shape)
+                    for i in range(3):
+                        for j in range(3):
+                            eps_grad_u[i] += eps_tensor_qp[i, j] * u.grad[j]
+                    # Compute ∇v · (ε·∇u)
+                    return (eps_grad_u[0] * v.grad[0] + 
+                            eps_grad_u[1] * v.grad[1] + 
+                            eps_grad_u[2] * v.grad[2])
+                A = asm(tensor_laplace, basis).tocsr()
+            else:
+                raise ValueError(f"Tensor epsilon shape {epsilon.shape} not recognized. "
+                                 f"Expected (ndofs, 3, 3), got {epsilon.shape}")
+        else:
+            raise ValueError(f"Epsilon array must be 1D (scalar field) or 3D (tensor field), "
+                             f"got {epsilon.ndim}D")
+    else:
+        raise TypeError(f"Epsilon must be None, scalar, array, or callable, got {type(epsilon)}")
+    
     b = M.dot(rho)
 
     # identify boundary nodes (skfem Mesh has .boundary_nodes when created from meshio)
