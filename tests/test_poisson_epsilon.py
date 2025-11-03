@@ -2,41 +2,60 @@
 import numpy as np
 from src import solver
 
+# Manufactured solution helpers
+def phi_exact_from_X(X):
+    # X has shape (3, N)
+    return np.sin(np.pi * X[0, :]) * np.sin(np.pi * X[1, :]) * np.sin(np.pi * X[2, :])
+
+def rhs_for_phi_exact(phi_exact):
+    # For phi = sin(pi x) sin(pi y) sin(pi z), Laplacian = -3*pi^2 * phi
+    # PDE is -div(eps grad phi) = rho. For eps=1 => rho = 3*pi^2 * phi_exact
+    return 3.0 * (np.pi ** 2) * phi_exact
+
+def l2_error(phi_num, phi_exact, M):
+    # M is the mass matrix assembled by solver. Compute sqrt((e)^T M (e))
+    e = phi_num - phi_exact
+    try:
+        Me = M.dot(e)
+    except Exception:
+        Me = M @ e
+    return np.sqrt(np.abs(e @ Me))
+
 def test_poisson_default_epsilon():
     """Test that default epsilon=None works like the original implementation."""
     mesh = solver.make_mesh_box(x0=(0,0,0), lengths=(1.0,1.0,1.0), char_length=0.4, verbose=False)
     mesh, basis, K, M = solver.assemble_operators(mesh)
-    
+
     # Create a simple source term
     rho = np.ones(basis.N)
-    
+
     # Solve with default (epsilon=None)
     phi_default = solver.solve_poisson(mesh, basis, rho, bc_value=0.0)
-    
+
     # Solve with explicit epsilon=1.0
     phi_explicit = solver.solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=1.0)
-    
-    # Should be very close
-    assert np.allclose(phi_default, phi_explicit, rtol=1e-10)
+
+    # Should be very close (tighter tolerance)
+    assert np.allclose(phi_default, phi_explicit, rtol=1e-12, atol=1e-12)
     assert np.all(np.isfinite(phi_default))
 
 def test_poisson_constant_scalar_epsilon():
     """Test Poisson solver with constant scalar epsilon."""
     mesh = solver.make_mesh_box(x0=(0,0,0), lengths=(1.0,1.0,1.0), char_length=0.4, verbose=False)
     mesh, basis, K, M = solver.assemble_operators(mesh)
-    
+
     rho = np.ones(basis.N)
-    
+
     # Solve with epsilon=1.0 and epsilon=2.0
     phi1 = solver.solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=1.0)
     phi2 = solver.solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=2.0)
-    
+
     # With doubled epsilon, the solution should scale differently
     # For -∇·(ε∇φ) = rho, doubling ε should approximately halve φ
     assert not np.allclose(phi1, phi2)
     assert np.all(np.isfinite(phi1))
     assert np.all(np.isfinite(phi2))
-    
+
     # Check that phi2 is smaller than phi1 (roughly half)
     # This is approximate due to boundary conditions
     interior_mask = np.abs(phi1) > 1e-10
@@ -47,15 +66,15 @@ def test_poisson_spatially_varying_scalar_epsilon_array():
     """Test Poisson solver with spatially varying scalar epsilon as array."""
     mesh = solver.make_mesh_box(x0=(0,0,0), lengths=(1.0,1.0,1.0), char_length=0.4, verbose=False)
     mesh, basis, K, M = solver.assemble_operators(mesh)
-    
+
     rho = np.ones(basis.N)
     X = basis.doflocs
-    
+
     # Create spatially varying epsilon: higher on one side
     epsilon = 1.0 + X[0, :]  # varies from 1 to 2 along x-axis
-    
+
     phi = solver.solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=epsilon)
-    
+
     assert np.all(np.isfinite(phi))
     assert phi.shape[0] == basis.N
 
@@ -182,7 +201,55 @@ def test_poisson_with_scf_integration():
     E, modes, phi, Vfinal = solver.scf_loop(mesh, basis, K, M, Vext,
                                            coupling=1.0, maxiter=10, tol=1e-5,
                                            mix=0.4, nev=2, verbose=False, use_diis=False)
-    
+
     assert np.isfinite(E[0])
-    assert modes.shape[1] == 2
+    assert modes.shape[1] == 2;
     assert np.all(np.isfinite(phi))
+
+
+# Manufactured-solution tests
+
+def test_poisson_manufactured_solution():
+    """Manufactured solution test: check numerical phi against analytic phi_exact."""
+    mesh = solver.make_mesh_box(x0=(0,0,0), lengths=(1.0,1.0,1.0), char_length=0.30, verbose=False)
+    mesh, basis, K, M = solver.assemble_operators(mesh)
+
+    X = basis.doflocs;
+    phi_ex = phi_exact_from_X(X);
+    rho = rhs_for_phi_exact(phi_ex);
+
+    phi_num = solver.solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=1.0);
+
+    err = l2_error(phi_num, phi_ex, M);
+
+    # Tolerance depends on mesh; with char_length ~0.30 this should be reasonably small.
+    assert err < 2e-3
+
+def test_poisson_manufactured_convergence():
+    """Convergence test for manufactured solution. Expect ~O(h^2) L2 error for linear FE."""
+    char_lengths = [0.6, 0.45, 0.30, 0.20]   # coarse -> fine
+    errors = [];
+    hs = [];
+
+    for h in char_lengths:
+        mesh = solver.make_mesh_box(x0=(0,0,0), lengths=(1.0,1.0,1.0), char_length=h, verbose=False);
+        mesh, basis, K, M = solver.assemble_operators(mesh);
+
+        X = basis.doflocs;
+        phi_ex = phi_exact_from_X(X);
+        rho = rhs_for_phi_exact(phi_ex);
+
+        phi_num = solver.solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=1.0);
+
+        err = l2_error(phi_num, phi_ex, M);
+        errors.append(err);
+        hs.append(h);
+
+    # compute empirical convergence rate from log-log slope
+    logh = np.log(hs);
+    loge = np.log(errors);
+    slope, intercept = np.polyfit(logh, loge, 1);
+    rate = -slope;
+
+    # For linear basis, L2 rate should approach 2.0. Use conservative threshold 1.5 to avoid false failures.
+    assert rate > 1.5, f"Observed L2 convergence rate too low: {rate:.2f}. errors={errors}",
