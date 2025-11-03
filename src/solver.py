@@ -11,7 +11,7 @@ import pygmsh
 import os
 
 # Mesh generator using pygmsh with configurable char_length / bounding box
-def make_mesh_box(x0=(0.0, 0.0, 0.0), lengths=(1.0, 1.0, 1.0), char_length=0.2, verbose=False):
+def make_mesh_box(x0=(0.0, 0.0, 0.0), lengths=(1.0, 1.0, 1.0), char_length=0.1, verbose=False):
     """
     Create a tetrahedral box mesh with pygmsh.
     - x0: lower corner (tuple of 3 floats)
@@ -19,21 +19,24 @@ def make_mesh_box(x0=(0.0, 0.0, 0.0), lengths=(1.0, 1.0, 1.0), char_length=0.2, 
     - char_length: target cell size (smaller -> finer mesh)
     Returns a skfem MeshTet.
     """
-    geom = pygmsh.geo.Geometry()
-    lx, ly, lz = lengths
-    with geom:
-        # add_box signature supports mesh_size (char_length)
-        box = geom.add_box(x0, lx, ly, lz, mesh_size=char_length)
-        geom.add_physical(box.surface, label="boundary")
-    mesh = pygmsh.generate_mesh(geom, geom_dim=3)
+    geom = pygmsh.occ.Geometry()
+    model3D = geom.__enter__()    
+    
+    box = model3D.add_box(x0=x0, extents=lengths, mesh_size=char_length)
+    smaller_lengths = tuple(np.array(lengths)*0.9)
+    print(smaller_lengths)    
+    
+    model3D.synchronize()    
+    model3D.add_physical(box, "box")    
+
+    geom.generate_mesh()
+    pygmsh.write("mesh.msh")
     # write/read via meshio to ensure compatibility, but avoid persisting large files
-    tmp = "tmp_mesh.vtk"
-    meshio.write(tmp, mesh)
-    meshio_mesh = meshio.read(tmp)
+    meshio_mesh = meshio.read("mesh.msh")
     sk_mesh = from_meshio(meshio_mesh)
-    os.remove(tmp)
+    
     if verbose:
-        print(f"generated mesh: {sk_mesh.nvertices} vertices, {sk_mesh.nelems} tets")
+        print(sk_mesh)        
     return sk_mesh
 
 def assemble_operators(mesh):
@@ -87,10 +90,11 @@ def solve_poisson(mesh, basis, rho, bc_value=0.0):
 
     # identify boundary nodes (skfem Mesh has .boundary_nodes when created from meshio)
     try:
-        bdofs = mesh.boundary_nodes
+        bdofs = mesh.boundary_nodes()        
     except Exception:
         # fallback: mark nodes with any boundary facet
-        bdofs = np.unique(mesh.facets.flatten())
+        bdofs = np.unique(mesh.facets.flatten())        
+    
     ndofs = basis.N
     all_idx = np.arange(ndofs)
     interior = np.setdiff1d(all_idx, bdofs)
@@ -247,10 +251,10 @@ def scf_loop(mesh, basis, K, M, Vext_func, coupling=1.0, maxiter=50, tol=1e-6,
 
 if __name__ == "__main__":
     # example run (small mesh for quick testing)
-    mesh = make_mesh_box(x0=(0, 0, 0), lengths=(1.0, 1.0, 1.0), char_length=0.25, verbose=True)
+    mesh = make_mesh_box(x0=(0, 0, 0), lengths=(2.0, 2.0, 2.0), char_length=0.25, verbose=True)
     mesh, basis, K, M = assemble_operators(mesh)
     Vext = lambda X: np.zeros(X.shape[1])   # zero external potential
     E, modes, phi, Vfinal = scf_loop(mesh, basis, K, M, Vext, coupling=1.0,
                                      maxiter=30, tol=1e-6, mix=0.4, nev=4, use_diis=True)
-    print("Lowest eigenvalue:", E[0])
+    print("Lowest 5 eigenvalues:", E[0:5])
 # ...existing code...
