@@ -118,13 +118,14 @@ def test_anisotropic_mass_tensor_callable():
 
 
 def test_scf_with_spatially_varying_mass():
-    """Test SCF loop with spatially varying effective mass."""
+    """Test SCF loop with spatially varying effective mass.
+    Mass varies linearly from 0.8 to 1.2 along x-axis."""
     mesh = solver.make_mesh_box(x0=(0, 0, 0), lengths=(1.0, 1.0, 1.0), 
                                char_length=0.4, verbose=False)
     mesh, basis, K, M = solver.assemble_operators(mesh)
     
     def mass_func(X):
-        """Mass varies spatially."""
+        """Mass varies linearly from 0.8 to 1.2 along x-axis."""
         return 0.8 + 0.4 * X[0, :]
     
     def Vext(X):
@@ -244,9 +245,12 @@ def test_flux_continuity_at_interface():
         return m
     
     # Gaussian charge distribution centered at interface
+    # Width parameter = 10.0 provides sharp localization
+    GAUSSIAN_WIDTH = 10.0  # Controls charge distribution width
+    
     def rho_func(X):
         r2 = (X[0] - 1.0)**2 + (X[1] - 0.5)**2 + (X[2] - 0.5)**2
-        return np.exp(-10.0 * r2)
+        return np.exp(-GAUSSIAN_WIDTH * r2)
     
     # Solve Poisson with discontinuous epsilon
     phi = solver.solve_poisson(mesh, basis, rho_func, bc_value=0.0, epsilon=epsilon_func)

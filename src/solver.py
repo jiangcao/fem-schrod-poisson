@@ -241,6 +241,45 @@ def normalize_modes(modes: np.ndarray, M: sp.spmatrix) -> np.ndarray:
     return modes
 
 
+def _invert_mass_tensor_field(mass_tensor):
+    """
+    Invert a field of 3×3 mass tensors efficiently.
+    
+    Parameters:
+    -----------
+    mass_tensor : ndarray of shape (3, 3, npts)
+        Mass tensor at each point
+        
+    Returns:
+    --------
+    mass_inv : ndarray of shape (3, 3, npts)
+        Inverse mass tensor at each point
+    """
+    npts = mass_tensor.shape[2]
+    mass_inv = np.zeros_like(mass_tensor)
+    
+    # Check if tensor is diagonal at all points (common case)
+    is_diagonal = True
+    for i in range(3):
+        for j in range(3):
+            if i != j and np.max(np.abs(mass_tensor[i, j, :])) > 1e-12:
+                is_diagonal = False
+                break
+        if not is_diagonal:
+            break
+    
+    if is_diagonal:
+        # Optimized path for diagonal tensors - element-wise inversion
+        for i in range(3):
+            mass_inv[i, i, :] = 1.0 / mass_tensor[i, i, :]
+    else:
+        # General case - invert each matrix
+        for i in range(npts):
+            mass_inv[:, :, i] = np.linalg.inv(mass_tensor[:, :, i])
+    
+    return mass_inv
+
+
 def solve_generalized_eig(
     K: sp.spmatrix,
     M: sp.spmatrix,
@@ -326,13 +365,9 @@ def solve_generalized_eig(
                 shape_qp = u.grad[0].shape
                 
                 if is_tensor(m_arr):
-                    # Tensor mass: 1/m_tensor is also a tensor
-                    # For simplicity, compute inverse at each point
+                    # Tensor mass: use helper function to invert efficiently
                     # m_arr has shape (3, 3, npts)
-                    npts = m_arr.shape[2]
-                    m_inv = np.zeros_like(m_arr)
-                    for i in range(npts):
-                        m_inv[:, :, i] = np.linalg.inv(m_arr[:, :, i])
+                    m_inv = _invert_mass_tensor_field(m_arr)
                     
                     # Assemble -c ∇·(m_inv ∇ψ)
                     res = 0.0
@@ -373,13 +408,11 @@ def solve_generalized_eig(
                     for j in range(3):
                         m_qp[i, j] = basis.interpolate(m_arr[:, i, j])
                 
-                # Invert at each quadrature point
+                # Use helper function to invert efficiently
                 shape_qp = m_qp[0, 0].shape
                 npts = np.prod(shape_qp)
                 m_qp_flat = m_qp.reshape(3, 3, npts)
-                m_inv_flat = np.zeros_like(m_qp_flat)
-                for i in range(npts):
-                    m_inv_flat[:, :, i] = np.linalg.inv(m_qp_flat[:, :, i])
+                m_inv_flat = _invert_mass_tensor_field(m_qp_flat)
                 m_inv_qp = m_inv_flat.reshape((3, 3) + shape_qp)
                 
                 @BilinearForm
