@@ -93,9 +93,46 @@ E, modes, phi, Vfinal = solver.scf_loop(
 )
 ```
 
+    ### Visualization
+
+    Visualize potential and wave function probability density:
+
+    ```python
+    from src import visualization as vis
+
+    # Plot potential and density on a 2D slice
+    fig, axes = vis.plot_potential_and_density(
+        basis, Vfinal, modes,
+        slice_axis='z', slice_value=0.5,
+        save_path='results/slice.png'
+    )
+
+    # Plot multiple slices
+    fig, axes = vis.plot_multiple_slices(
+        basis, Vfinal, modes,
+        slice_axis='z', slice_positions=[0.3, 0.5, 0.7]
+    )
+
+    # 1D line profile through the center
+    fig, axes = vis.plot_1d_line_profile(
+        basis, Vfinal, modes,
+        axis='z', fixed_coords={'x': 0.5, 'y': 0.5}
+    )
+
+    # 3D isosurface of probability density
+    fig, ax = vis.plot_3d_isosurface(basis, modes, iso_level=0.5)
+
+    # Energy level diagram
+    fig, ax = vis.plot_energy_levels(E, n_levels=4)
+    ```
+
+    See `docs/VISUALIZATION.md` for detailed documentation.
+
 ## Examples
 
-See `examples/demo_epsilon.py` for complete examples of all epsilon variations.
+    - `examples/demo_epsilon.py` - Poisson solver with various epsilon configurations
+    - `examples/demo_visualization.py` - Visualization utilities showcase
+    - `examples/demo_heterostructure.py` - Heterostructure with spatially varying epsilon
 
 Run examples:
 

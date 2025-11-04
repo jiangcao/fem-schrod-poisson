@@ -1,6 +1,7 @@
-/.venv/
+/.venv*/
 *.py[cod]
 __pycache__/
 *.egg-info/
 mesh.msh
 .DS_Store
+*.png

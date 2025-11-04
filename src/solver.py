@@ -2,7 +2,7 @@
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
-from skfem import Basis, ElementTetP1, asm
+from skfem import Basis, ElementTetP1, ElementTetP2, asm, BilinearForm
 from skfem.mesh import MeshTet
 from skfem.models.poisson import laplace
 from skfem.io import from_meshio
@@ -23,11 +23,9 @@ def make_mesh_box(x0=(0.0, 0.0, 0.0), lengths=(1.0, 1.0, 1.0), char_length=0.1, 
     model3D = geom.__enter__()    
     
     box = model3D.add_box(x0=x0, extents=lengths, mesh_size=char_length)
-    smaller_lengths = tuple(np.array(lengths)*0.9)
-    print(smaller_lengths)    
-    
-    model3D.synchronize()    
-    model3D.add_physical(box, "box")    
+
+    model3D.synchronize()
+    model3D.add_physical(box, "box")
 
     geom.generate_mesh()
     pygmsh.write("mesh.msh")
@@ -39,16 +37,25 @@ def make_mesh_box(x0=(0.0, 0.0, 0.0), lengths=(1.0, 1.0, 1.0), char_length=0.1, 
         print(sk_mesh)        
     return sk_mesh
 
-def assemble_operators(mesh):
+def assemble_operators(mesh, element_order: int = 1):
+    """Assemble stiffness and mass for the given mesh.
+
+    element_order: 1 -> P1 (linear), 2 -> P2 (quadratic)
     """
-    Assemble stiffness (K) and mass (M) matrices on P1 tetrahedra.
-    """
-    element = ElementTetP1()
+    if element_order == 1:
+        element = ElementTetP1()
+    elif element_order == 2:
+        element = ElementTetP2()
+    else:
+        raise ValueError(f"Unsupported element_order: {element_order}")
+
     basis = Basis(mesh, element)
-    K = asm(laplace, basis)                # stiffness for -Δ
-    # simple mass assembly via element routine (P1 mass)
+
+    @BilinearForm
     def mass(u, v, w):
         return u * v
+
+    K = asm(laplace, basis)
     M = asm(mass, basis)
     return mesh, basis, K.tocsr(), M.tocsr()
 
@@ -205,14 +212,88 @@ def solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=None):
     else:
         raise TypeError(f"Epsilon must be None, scalar, array, or callable, got {type(epsilon)}")
     
-    b = M.dot(rho)
+    # Build RHS vector b = (v, rho).
+    # Accept either:
+    # - rho as a 1D array of nodal values (DOF values) => assemble using interpolated
+    #   values at quadrature points for a more accurate load vector,
+    # - rho as a callable(X) that returns values at quadrature points => assemble directly.
+    if callable(rho):
+        def rhs_form(v, w):
+            # w.x has shape (3, nelems, nqp); reshape to (3, nelems*nqp) for callable
+            x_flat = w.x.reshape(3, -1)
+            rq = rho(x_flat)
+            rq = rq.reshape(v.shape)
+            return v * rq
+        b = asm(rhs_form, basis)
+    else:
+        # rho is array of DOF values: interpolate to quadrature points and assemble
+        if len(rho) != basis.N:
+            raise ValueError(f"rho array length {len(rho)} must match ndofs {basis.N}")
+        rho_qp = basis.interpolate(rho)
+        def rhs_form(v, w):
+            return v * rho_qp
+        b = asm(rhs_form, basis)
 
-    # identify boundary nodes (skfem Mesh has .boundary_nodes when created from meshio)
+    # identify boundary DOFs robustly for both linear and higher-order bases.
+    # Prefer basis.boundary() which returns a FacetBasis containing the DOF indices
+    # on boundary facets (works for P1, P2, etc.). Fall back to mesh.boundary_nodes()
+    # (vertex-only) or the facet flatten fallback.
     try:
-        bdofs = mesh.boundary_nodes()        
+        fb = basis.boundary()
+        try:
+            bdofs = np.asarray(fb.dofs)
+            # If it's an object array or nested, try to flatten
+            try:
+                bdofs = np.unique(bdofs.ravel().astype(int))
+            except Exception:
+                # handle nested sequences
+                import numpy as _np
+                try:
+                    bdofs = _np.unique(_np.hstack([_np.asarray(x).ravel() for x in bdofs]))
+                except Exception:
+                    bdofs = _np.unique(_np.asarray(mesh.boundary_nodes()))
+        except Exception:
+            # fb.dofs may be unavailable; try get_dofs()
+            try:
+                gd = fb.get_dofs()
+                all_dofs = []
+                for v in gd.values():
+                    all_dofs.extend(list(v))
+                bdofs = np.unique(np.array(all_dofs, dtype=int))
+            except Exception:
+                # Last resort: try converting facet_dofs from basis
+                try:
+                    bdofs = np.unique(np.asarray(basis.facet_dofs).ravel())
+                except Exception:
+                    bdofs = np.unique(mesh.facets.flatten())
     except Exception:
-        # fallback: mark nodes with any boundary facet
-        bdofs = np.unique(mesh.facets.flatten())        
+        try:
+            bdofs = mesh.boundary_nodes()
+        except Exception:
+            # fallback: mark nodes with any boundary facet
+            bdofs = np.unique(mesh.facets.flatten())
+
+        # If bdofs is empty (some skfem versions or mesh conversions), fall back
+        # to geometric detection from DOF coordinates (works for P1 and P2).
+        try:
+            bdofs_arr = np.asarray(bdofs)
+            if bdofs_arr.size == 0:
+                # detect DOFs lying on the bounding box of the mesh
+                X = basis.doflocs
+                # bounding box from original mesh vertices
+                p = mesh.p
+                xmin, xmax = p[0, :].min(), p[0, :].max()
+                ymin, ymax = p[1, :].min(), p[1, :].max()
+                zmin, zmax = p[2, :].min(), p[2, :].max()
+                tol = 1e-8
+                mask = (
+                    (np.abs(X[0, :] - xmin) < tol) | (np.abs(X[0, :] - xmax) < tol) |
+                    (np.abs(X[1, :] - ymin) < tol) | (np.abs(X[1, :] - ymax) < tol) |
+                    (np.abs(X[2, :] - zmin) < tol) | (np.abs(X[2, :] - zmax) < tol)
+                )
+                bdofs = np.nonzero(mask)[0]
+        except Exception:
+            pass
     
     ndofs = basis.N
     all_idx = np.arange(ndofs)
@@ -336,4 +417,3 @@ if __name__ == "__main__":
     E, modes, phi, Vfinal = scf_loop(mesh, basis, K, M, Vext, coupling=1.0,
                                      maxiter=30, tol=1e-6, mix=0.4, nev=4, use_diis=True)
     print("Lowest 5 eigenvalues:", E[0:5])
-# ...existing code...
