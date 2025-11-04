@@ -2,13 +2,33 @@
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
-from skfem import Basis, ElementTetP1, ElementTetP2, asm, BilinearForm
+from skfem import Basis, ElementTetP1, ElementTetP2, asm, BilinearForm, LinearForm
 from skfem.mesh import MeshTet
 from skfem.models.poisson import laplace
 from skfem.io import from_meshio
 import meshio
 import pygmsh
 import os
+from dataclasses import dataclass
+
+
+@dataclass
+class PhysicalParams:
+    """
+    Container for physical constants. Defaults mimic the existing
+    dimensionless setup (ħ = 1, m = 1, q = -1, ε0 = 1, one particle).
+
+    - hbar: Planck's reduced constant
+    - m_eff: effective mass
+    - q: particle charge (electron: -1 in dimensionless units)
+    - epsilon0: permittivity of free space (or unit system baseline)
+    - n_particles: number of particles represented by |psi|^2
+    """
+    hbar: float = 1.0
+    m_eff: float = 1.0
+    q: float = -1.0
+    epsilon0: float = 1.0
+    n_particles: float = 1.0
 
 # Mesh generator using pygmsh with configurable char_length / bounding box
 def make_mesh_box(x0=(0.0, 0.0, 0.0), lengths=(1.0, 1.0, 1.0), char_length=0.1, verbose=False):
@@ -50,264 +70,15 @@ def assemble_operators(mesh, element_order: int = 1):
         raise ValueError(f"Unsupported element_order: {element_order}")
 
     basis = Basis(mesh, element)
+    K = asm(laplace, basis).tocsr()
 
     @BilinearForm
     def mass(u, v, w):
         return u * v
-
-    K = asm(laplace, basis)
-    M = asm(mass, basis)
-    return mesh, basis, K.tocsr(), M.tocsr()
-
-def potential_vector_from_callable(basis, V_func):
-    """
-    Build potential vector evaluated at DOFs.
-    V_func: callable(X) -> array(len=ndofs), X shape (3, ndofs)
-    returns 1D numpy array of length ndofs
-    """
-    X = basis.doflocs  # shape (3, ndofs)
-    return np.asarray(V_func(X))
-
-def solve_generalized_eig(K, M, Vvec, nev=4, which='SM'):
-    """
-    Solve H psi = E M psi where H = -0.5*K + M*diag(Vvec)
-    Vvec: 1d array length ndofs
-    """
-    Vdiag = sp.diags(Vvec)
-    H = -0.5 * K + M.dot(Vdiag)
-    E, psi = spla.eigsh(H, k=nev, M=M, which=which)
-    idx = np.argsort(E)
-    return E[idx], psi[:, idx]
-
-def normalize_modes(psi, M):
-    norms = np.sqrt(np.abs(np.sum(psi * (M.dot(psi)), axis=0)))
-    return psi / norms
-
-def solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=None):
-    """
-    Solve -∇·(ε∇φ) = rho with Dirichlet bc=bc_value on boundary nodes.
-    
-    Parameters:
-    -----------
-    mesh : skfem.Mesh
-        The mesh
-    basis : skfem.Basis
-        The basis functions
-    rho : array length ndofs
-        Source term (density given at DOFs)
-    bc_value : float, optional
-        Dirichlet boundary condition value (default 0.0)
-    epsilon : None, float, array, or callable, optional
-        Spatially varying permittivity/diffusion coefficient:
-        - None (default): constant epsilon=1.0 (standard Laplace)
-        - float: constant scalar epsilon
-        - array of shape (ndofs,): spatially varying scalar epsilon at DOFs
-        - array of shape (ndofs, 3, 3): tensor epsilon at DOFs
-        - callable(X) -> scalar array or tensor array: function of coordinates
-          where X has shape (3, npts) and returns either:
-            * 1D array of shape (npts,) for scalar epsilon
-            * 3D array of shape (3, 3, npts) for tensor epsilon
-    
-    Returns:
-    --------
-    phi : array length ndofs
-        Solution at DOFs
-    """
-    def mass(u, v, w):
-        return u * v
     M = asm(mass, basis).tocsr()
-    
-    # Assemble stiffness matrix based on epsilon
-    if epsilon is None:
-        # Standard Laplace operator: -Δφ
-        A = asm(laplace, basis).tocsr()
-    elif np.isscalar(epsilon):
-        # Constant scalar epsilon: -ε∇²φ
-        A = epsilon * asm(laplace, basis).tocsr()
-    elif callable(epsilon):
-        # Epsilon is a callable function
-        # Evaluate once to check dimensionality (returns scalar or tensor)
-        # Note: We must evaluate epsilon again inside the form at quadrature points,
-        # so this initial call is just for determining the return type
-        eps_check = epsilon(basis.doflocs)
-        if eps_check.ndim == 1:
-            # Scalar field: -∇·(ε∇φ)
-            def weighted_laplace(u, v, w):
-                # w.x has shape (3, nelems, nqp)
-                # Reshape to (3, nelems*nqp) for epsilon function
-                x_flat = w.x.reshape(3, -1)
-                eps_qp = epsilon(x_flat)  # Returns shape (nelems*nqp,)
-                # Reshape back to (nelems, nqp)
-                eps_qp = eps_qp.reshape(u.grad[0].shape)
-                return eps_qp * (u.grad[0] * v.grad[0] + 
-                                 u.grad[1] * v.grad[1] + 
-                                 u.grad[2] * v.grad[2])
-            A = asm(weighted_laplace, basis).tocsr()
-        else:
-            # Tensor field: -∇·(ε·∇φ)
-            def tensor_laplace(u, v, w):
-                # w.x has shape (3, nelems, nqp)
-                # Reshape to (3, nelems*nqp) for epsilon function
-                x_flat = w.x.reshape(3, -1)
-                eps_tensor = epsilon(x_flat)  # Returns shape (3, 3, nelems*nqp)
-                # Reshape to (3, 3, nelems, nqp)
-                eps_tensor = eps_tensor.reshape(3, 3, *u.grad[0].shape)
-                # Compute ε·∇u
-                eps_grad_u = np.zeros((3,) + u.grad[0].shape)
-                for i in range(3):
-                    for j in range(3):
-                        eps_grad_u[i] += eps_tensor[i, j] * u.grad[j]
-                # Compute ∇v · (ε·∇u)
-                return (eps_grad_u[0] * v.grad[0] + 
-                        eps_grad_u[1] * v.grad[1] + 
-                        eps_grad_u[2] * v.grad[2])
-            A = asm(tensor_laplace, basis).tocsr()
-    elif isinstance(epsilon, np.ndarray):
-        if epsilon.ndim == 1:
-            # Array of scalar values at DOFs
-            if len(epsilon) != basis.N:
-                raise ValueError(f"Epsilon array length {len(epsilon)} must match ndofs {basis.N}")
-            # Interpolate to quadrature points
-            eps_qp = basis.interpolate(epsilon)  # shape (nelems, nqp)
-            
-            def weighted_laplace(u, v, w):
-                return eps_qp * (u.grad[0] * v.grad[0] + 
-                                 u.grad[1] * v.grad[1] + 
-                                 u.grad[2] * v.grad[2])
-            A = asm(weighted_laplace, basis).tocsr()
-        elif epsilon.ndim == 3:
-            # Tensor epsilon at DOFs
-            if epsilon.shape[0] == basis.N and epsilon.shape[1:] == (3, 3):
-                # Epsilon given at DOFs: shape (ndofs, 3, 3)
-                # Interpolate each component separately
-                # Interpolate one component to get the shape, then allocate array
-                eps_00 = basis.interpolate(epsilon[:, 0, 0])
-                eps_tensor_qp = np.zeros((3, 3) + eps_00.shape)
-                eps_tensor_qp[0, 0] = eps_00
-                # Interpolate remaining components
-                for i in range(3):
-                    for j in range(3):
-                        if i == 0 and j == 0:
-                            continue  # Already done
-                        eps_tensor_qp[i, j] = basis.interpolate(epsilon[:, i, j])
-                
-                def tensor_laplace(u, v, w):
-                    # eps_tensor_qp has shape (3, 3, nelems, nqp)
-                    # Compute ε·∇u
-                    eps_grad_u = np.zeros((3,) + u.grad[0].shape)
-                    for i in range(3):
-                        for j in range(3):
-                            eps_grad_u[i] += eps_tensor_qp[i, j] * u.grad[j]
-                    # Compute ∇v · (ε·∇u)
-                    return (eps_grad_u[0] * v.grad[0] + 
-                            eps_grad_u[1] * v.grad[1] + 
-                            eps_grad_u[2] * v.grad[2])
-                A = asm(tensor_laplace, basis).tocsr()
-            else:
-                raise ValueError(f"Tensor epsilon shape {epsilon.shape} not recognized. "
-                                 f"Expected (ndofs, 3, 3), got {epsilon.shape}")
-        else:
-            raise ValueError(f"Epsilon array must be 1D (scalar field) or 3D (tensor field), "
-                             f"got {epsilon.ndim}D")
-    else:
-        raise TypeError(f"Epsilon must be None, scalar, array, or callable, got {type(epsilon)}")
-    
-    # Build RHS vector b = (v, rho).
-    # Accept either:
-    # - rho as a 1D array of nodal values (DOF values) => assemble using interpolated
-    #   values at quadrature points for a more accurate load vector,
-    # - rho as a callable(X) that returns values at quadrature points => assemble directly.
-    if callable(rho):
-        def rhs_form(v, w):
-            # w.x has shape (3, nelems, nqp); reshape to (3, nelems*nqp) for callable
-            x_flat = w.x.reshape(3, -1)
-            rq = rho(x_flat)
-            rq = rq.reshape(v.shape)
-            return v * rq
-        b = asm(rhs_form, basis)
-    else:
-        # rho is array of DOF values: interpolate to quadrature points and assemble
-        if len(rho) != basis.N:
-            raise ValueError(f"rho array length {len(rho)} must match ndofs {basis.N}")
-        rho_qp = basis.interpolate(rho)
-        def rhs_form(v, w):
-            return v * rho_qp
-        b = asm(rhs_form, basis)
+    return mesh, basis, K, M
 
-    # identify boundary DOFs robustly for both linear and higher-order bases.
-    # Prefer basis.boundary() which returns a FacetBasis containing the DOF indices
-    # on boundary facets (works for P1, P2, etc.). Fall back to mesh.boundary_nodes()
-    # (vertex-only) or the facet flatten fallback.
-    try:
-        fb = basis.boundary()
-        try:
-            bdofs = np.asarray(fb.dofs)
-            # If it's an object array or nested, try to flatten
-            try:
-                bdofs = np.unique(bdofs.ravel().astype(int))
-            except Exception:
-                # handle nested sequences
-                import numpy as _np
-                try:
-                    bdofs = _np.unique(_np.hstack([_np.asarray(x).ravel() for x in bdofs]))
-                except Exception:
-                    bdofs = _np.unique(_np.asarray(mesh.boundary_nodes()))
-        except Exception:
-            # fb.dofs may be unavailable; try get_dofs()
-            try:
-                gd = fb.get_dofs()
-                all_dofs = []
-                for v in gd.values():
-                    all_dofs.extend(list(v))
-                bdofs = np.unique(np.array(all_dofs, dtype=int))
-            except Exception:
-                # Last resort: try converting facet_dofs from basis
-                try:
-                    bdofs = np.unique(np.asarray(basis.facet_dofs).ravel())
-                except Exception:
-                    bdofs = np.unique(mesh.facets.flatten())
-    except Exception:
-        try:
-            bdofs = mesh.boundary_nodes()
-        except Exception:
-            # fallback: mark nodes with any boundary facet
-            bdofs = np.unique(mesh.facets.flatten())
-
-        # If bdofs is empty (some skfem versions or mesh conversions), fall back
-        # to geometric detection from DOF coordinates (works for P1 and P2).
-        try:
-            bdofs_arr = np.asarray(bdofs)
-            if bdofs_arr.size == 0:
-                # detect DOFs lying on the bounding box of the mesh
-                X = basis.doflocs
-                # bounding box from original mesh vertices
-                p = mesh.p
-                xmin, xmax = p[0, :].min(), p[0, :].max()
-                ymin, ymax = p[1, :].min(), p[1, :].max()
-                zmin, zmax = p[2, :].min(), p[2, :].max()
-                tol = 1e-8
-                mask = (
-                    (np.abs(X[0, :] - xmin) < tol) | (np.abs(X[0, :] - xmax) < tol) |
-                    (np.abs(X[1, :] - ymin) < tol) | (np.abs(X[1, :] - ymax) < tol) |
-                    (np.abs(X[2, :] - zmin) < tol) | (np.abs(X[2, :] - zmax) < tol)
-                )
-                bdofs = np.nonzero(mask)[0]
-        except Exception:
-            pass
-    
-    ndofs = basis.N
-    all_idx = np.arange(ndofs)
-    interior = np.setdiff1d(all_idx, bdofs)
-
-    Aii = A[interior][:, interior]
-    bi = b[interior] - A[interior][:, bdofs].dot(np.full(len(bdofs), bc_value))
-    phi = np.full(ndofs, bc_value, dtype=float)
-    phi_i = spla.spsolve(Aii, bi)
-    phi[interior] = phi_i
-    return phi
-
-
-
+    # (no-op)
 
 # DIIS (Pulay) mixer
 class DIIS:
@@ -357,7 +128,8 @@ class DIIS:
 # ...existing code (mesh, assemble_operators, potential builders) ...
 
 def scf_loop(mesh, basis, K, M, Vext_func, coupling=1.0, maxiter=50, tol=1e-6,
-             mix=0.3, nev=4, verbose=True, use_diis=False, diis_max=6):
+             mix=0.3, nev=4, verbose=True, use_diis=False, diis_max=6,
+             phys: PhysicalParams | None = None):
     """
     Self-consistent loop with optional DIIS (use_diis=True).
     If DIIS is enabled, simple linear mixing is used for first iterations while DIIS accumulates.
@@ -370,16 +142,24 @@ def scf_loop(mesh, basis, K, M, Vext_func, coupling=1.0, maxiter=50, tol=1e-6,
     prev_energy = None
 
     diis = DIIS(max_vec=diis_max) if use_diis else None
+    kinetic_coeff = (phys.hbar ** 2) / (2.0 * phys.m_eff) if phys is not None else 0.5
 
     for it in range(1, maxiter + 1):
-        E, modes = solve_generalized_eig(K, M, V_old, nev=nev, which='SM')
+        E, modes = solve_generalized_eig(K, M, V_old, nev=nev, which='SM', kinetic_coeff=kinetic_coeff, basis=basis, mesh=mesh, dirichlet_bc=False, Vfunc=Vext_func)
         modes = normalize_modes(modes, M)
         psi0 = modes[:, 0]
-        rho = np.abs(psi0)**2
+        # Convert to charge density if physical constants are provided
+        if phys is not None:
+            rho = phys.n_particles * phys.q * (np.abs(psi0) ** 2)
+        else:
+            rho = np.abs(psi0) ** 2
 
         phi = solve_poisson(mesh, basis, rho, bc_value=0.0)
 
-        V_new = Vext_vec + coupling * phi
+        if phys is not None:
+            V_new = Vext_vec + coupling * (phys.q * phi)
+        else:
+            V_new = Vext_vec + coupling * phi
 
         if use_diis:
             # add pair to DIIS (use V_old->V_new residual)
@@ -408,6 +188,228 @@ def scf_loop(mesh, basis, K, M, Vext_func, coupling=1.0, maxiter=50, tol=1e-6,
         prev_energy = total_energy
 
     return E, modes, phi, V_old
+
+# --- Helpers and solvers ---
+
+def potential_vector_from_callable(basis: Basis, Vfunc):
+    """
+    Evaluate a potential function Vfunc(X) at the DOF locations and return
+    a vector of length ndofs.
+    """
+    X = basis.doflocs
+    V = Vfunc(X)
+    V = np.asarray(V).reshape(-1)
+    if V.shape[0] != basis.N:
+        raise ValueError("Vfunc must return an array of length equal to number of DOFs")
+    return V
+
+
+def normalize_modes(modes: np.ndarray, M: sp.spmatrix) -> np.ndarray:
+    """
+    Normalize eigenmodes such that psi^T M psi = 1 for each column.
+    """
+    modes = np.asarray(modes, dtype=float)
+    for i in range(modes.shape[1]):
+        v = modes[:, i]
+        n = float(v @ (M.dot(v)))
+        if n <= 0:
+            continue
+        modes[:, i] = v / np.sqrt(n)
+    return modes
+
+
+def solve_generalized_eig(
+    K: sp.spmatrix,
+    M: sp.spmatrix,
+    V: np.ndarray,
+    nev=4,
+    which='SM',
+    kinetic_coeff: float = 0.5,
+    basis: Basis | None = None,
+    mesh: MeshTet | None = None,
+    dirichlet_bc: bool = True,
+    Vfunc=None,
+):
+    """
+    Solve the generalized eigenproblem:
+        ( -kinetic_coeff * K + V_M ) psi = E M psi
+    where V_M is the potential operator assembled as a weighted mass matrix
+    using the nodal potential values V.
+    """
+    if sp.issparse(K):
+        K = K.tocsr()
+    if sp.issparse(M):
+        M = M.tocsr()
+    V = np.asarray(V).reshape(-1)
+    n = M.shape[0]
+    if V.shape[0] != n:
+        raise ValueError("Dimension mismatch for potential vector V")
+
+    # Assemble weighted mass matrix for potential term
+    # Assemble potential operator
+    if Vfunc is not None and basis is not None:
+        @BilinearForm
+        def v_mass(u, v, w):
+            X_flat = w.x.reshape(3, -1)
+            V_qp = np.asarray(Vfunc(X_flat)).reshape(u.grad[0].shape)
+            return V_qp * u * v
+        V_M = asm(v_mass, basis).tocsr()
+    else:
+        # Fallback to diagonal potential
+        V_M = sp.diags(V)
+
+    H = (kinetic_coeff) * K + V_M
+
+    # Apply Dirichlet boundary conditions by restricting to interior DOFs if requested
+    if dirichlet_bc and mesh is not None:
+        try:
+            bdofs = mesh.boundary_nodes()
+        except Exception:
+            try:
+                bdofs = np.unique(mesh.facets.flatten())
+            except Exception:
+                bdofs = np.array([], dtype=int)
+        bdofs = np.asarray(bdofs, dtype=int)
+        all_idx = np.arange(M.shape[0])
+        interior = np.setdiff1d(all_idx, bdofs)
+        k_eff = min(nev, max(1, interior.size - 1))
+        Hi = H[interior][:, interior]
+        Mi = M[interior][:, interior]
+        try:
+            E, modes_i = spla.eigsh(Hi, k=k_eff, M=Mi, which=which)
+        except Exception:
+            E, modes_i = spla.eigsh(Hi, k=k_eff, M=Mi, sigma=0.0, which='LM')
+        idx = np.argsort(E)
+        E = E[idx]
+        modes_i = modes_i[:, idx]
+        modes = np.zeros((M.shape[0], modes_i.shape[1]))
+        modes[interior, :] = modes_i
+        return E, modes
+
+    try:
+        E, modes = spla.eigsh(H, k=nev, M=M, which=which)
+    except Exception:
+        # Fallback: use shift-invert near zero
+        E, modes = spla.eigsh(H, k=nev, M=M, sigma=0.0, which='LM')
+    idx = np.argsort(E)
+    return E[idx], modes[:, idx]
+
+
+def solve_poisson(mesh, basis: Basis, rho, bc_value: float = 0.0, epsilon=None):
+    """
+
+    epsilon can be:
+      - None: treated as 1.0
+      - scalar: constant
+      - 1D array of length ndofs: scalar epsilon at DOFs (interpolated to quadrature)
+      - callable(X): returns scalar array (npts,) or tensor array (3,3,npts)
+      - 3D array of shape (ndofs,3,3): tensor epsilon at DOFs (interpolated per component)
+    rho can be:
+      - array of length ndofs
+      - callable(X): returns array (npts,)
+    """
+    # Assemble stiffness matrix A depending on epsilon
+    if epsilon is None:
+        A = asm(laplace, basis).tocsr()
+    elif np.isscalar(epsilon):
+        A = float(epsilon) * asm(laplace, basis).tocsr()
+    elif callable(epsilon):
+        # Evaluate at quadrature points inside the bilinear form
+        def is_tensor(eps_samp):
+            arr = np.asarray(eps_samp)
+            return arr.ndim == 3 and arr.shape[0] == 3 and arr.shape[1] == 3
+
+        @BilinearForm
+        def weighted(u, v, w):
+            X_flat = w.x.reshape(3, -1)
+            eps_val = epsilon(X_flat)
+            eps_arr = np.asarray(eps_val)
+            shape_qp = u.grad[0].shape
+            if is_tensor(eps_arr):
+                # tensor case: eps[i,j,npts] -> reshape to (nelems, nqp)
+                res = 0.0
+                for i in range(3):
+                    for j in range(3):
+                        eps_qp = eps_arr[i, j, :].reshape(shape_qp)
+                        res = res + eps_qp * u.grad[j] * v.grad[i]
+                return res
+            else:
+                # scalar case: shape (npts,) -> reshape to quadrature shape
+                eps_qp = eps_arr.reshape(shape_qp)
+                return eps_qp * (u.grad[0] * v.grad[0] + u.grad[1] * v.grad[1] + u.grad[2] * v.grad[2])
+
+        A = asm(weighted, basis).tocsr()
+    elif isinstance(epsilon, np.ndarray):
+        eps_arr = np.asarray(epsilon)
+        if eps_arr.ndim == 1:
+            if eps_arr.shape[0] != basis.N:
+                raise ValueError("epsilon array length must match number of DOFs")
+            eps_qp = basis.interpolate(eps_arr)
+
+            @BilinearForm
+            def weighted(u, v, w):
+                return eps_qp * (u.grad[0] * v.grad[0] + u.grad[1] * v.grad[1] + u.grad[2] * v.grad[2])
+
+            A = asm(weighted, basis).tocsr()
+        elif eps_arr.ndim == 3 and eps_arr.shape[0] == basis.N and eps_arr.shape[1:] == (3, 3):
+            # interpolate each component to quadrature
+            eps_qp = np.zeros((3, 3) + basis.interpolate(eps_arr[:, 0, 0]).shape)
+            for i in range(3):
+                for j in range(3):
+                    eps_qp[i, j] = basis.interpolate(eps_arr[:, i, j])
+
+            @BilinearForm
+            def weighted(u, v, w):
+                res = 0.0
+                for i in range(3):
+                    for j in range(3):
+                        res = res + eps_qp[i, j] * u.grad[j] * v.grad[i]
+                return res
+
+            A = asm(weighted, basis).tocsr()
+        else:
+            raise ValueError("Unsupported epsilon array shape")
+    else:
+        raise TypeError("epsilon must be None, scalar, array, or callable")
+
+    # Assemble RHS b
+    if callable(rho):
+        @LinearForm
+        def rhsform(v, w):
+            Xq = w.x.reshape(3, -1)
+            rho_qp = np.asarray(rho(Xq)).reshape(v.shape)
+            return v * rho_qp
+        b = asm(rhsform, basis)
+    else:
+        rho_arr = np.asarray(rho).reshape(-1)
+        if rho_arr.shape[0] != basis.N:
+            raise ValueError("rho array length must match number of DOFs")
+        rho_qp = basis.interpolate(rho_arr)
+
+        @LinearForm
+        def rhsform(v, w):
+            return v * rho_qp
+        b = asm(rhsform, basis)
+
+    # Boundary DOFs
+    try:
+        bdofs = mesh.boundary_nodes()
+    except Exception:
+        try:
+            bdofs = np.unique(mesh.facets.flatten())
+        except Exception:
+            bdofs = np.array([], dtype=int)
+    bdofs = np.asarray(bdofs, dtype=int)
+    all_idx = np.arange(basis.N)
+    interior = np.setdiff1d(all_idx, bdofs)
+
+    # Solve interior system with Dirichlet boundary conditions
+    Aii = A[interior][:, interior]
+    bi = b[interior] - A[interior][:, bdofs].dot(np.full(bdofs.shape[0], bc_value))
+    phi = np.full(basis.N, bc_value, dtype=float)
+    phi_i = spla.spsolve(Aii, bi)
+    phi[interior] = phi_i
+    return phi
 
 if __name__ == "__main__":
     # example run (small mesh for quick testing)
