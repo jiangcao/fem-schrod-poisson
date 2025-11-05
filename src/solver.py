@@ -469,18 +469,53 @@ def solve_generalized_eig(
     return E[idx], modes[:, idx]
 
 
-def solve_poisson(mesh, basis: Basis, rho, bc_value: float = 0.0, epsilon=None):
+def solve_poisson(mesh, basis: Basis, rho, bc_value: float = 0.0, epsilon=None, bc=None):
     """
+    Solve the Poisson equation -∇·(ε∇φ) = ρ with flexible boundary conditions.
 
-    epsilon can be:
-      - None: treated as 1.0
-      - scalar: constant
-      - 1D array of length ndofs: scalar epsilon at DOFs (interpolated to quadrature)
-      - callable(X): returns scalar array (npts,) or tensor array (3,3,npts)
-      - 3D array of shape (ndofs,3,3): tensor epsilon at DOFs (interpolated per component)
-    rho can be:
-      - array of length ndofs
-      - callable(X): returns array (npts,)
+    Parameters:
+    -----------
+    mesh : MeshTet
+        The finite element mesh
+    basis : Basis
+        The finite element basis
+    rho : array or callable
+        Source term (charge density)
+        - array of length ndofs
+        - callable(X): returns array (npts,)
+    bc_value : float, optional
+        Constant Dirichlet boundary value (default: 0.0)
+        Used only if bc is None
+    epsilon : None, scalar, array, or callable, optional
+        Dielectric constant
+        - None: treated as 1.0
+        - scalar: constant
+        - 1D array of length ndofs: scalar epsilon at DOFs (interpolated to quadrature)
+        - callable(X): returns scalar array (npts,) or tensor array (3,3,npts)
+        - 3D array of shape (ndofs,3,3): tensor epsilon at DOFs (interpolated per component)
+    bc : dict, optional
+        Boundary condition specification from boundary_conditions module.
+        If provided, overrides bc_value.
+        Should have 'nodes' and 'values' keys.
+        
+    Returns:
+    --------
+    phi : ndarray
+        Solution vector at DOFs
+        
+    Examples:
+    ---------
+    >>> # Simple constant BC
+    >>> phi = solve_poisson(mesh, basis, rho, bc_value=0.0)
+    >>> 
+    >>> # Using boundary condition utilities
+    >>> from src import boundary_conditions as bc_utils
+    >>> bc_left = bc_utils.create_dirichlet_bc(basis, value=1.0, 
+    ...     nodes=bc_utils.get_boundary_nodes_by_plane(basis, 'x', 0.0))
+    >>> bc_right = bc_utils.create_dirichlet_bc(basis, value=0.0,
+    ...     nodes=bc_utils.get_boundary_nodes_by_plane(basis, 'x', 1.0))
+    >>> bc_combined = bc_utils.combine_boundary_conditions([bc_left, bc_right])
+    >>> phi = solve_poisson(mesh, basis, rho, bc=bc_combined)
     """
     # Assemble stiffness matrix A depending on epsilon
     if epsilon is None:
@@ -565,22 +600,41 @@ def solve_poisson(mesh, basis: Basis, rho, bc_value: float = 0.0, epsilon=None):
             return v * rho_qp
         b = asm(rhsform, basis)
 
-    # Boundary DOFs
-    try:
-        bdofs = mesh.boundary_nodes()
-    except Exception:
+    # Boundary DOFs and values
+    if bc is not None:
+        # Use provided boundary condition specification
+        bdofs = np.asarray(bc['nodes'], dtype=int)
+        bc_values = bc['values']
+        
+        # Handle scalar boundary values
+        if np.isscalar(bc_values):
+            bc_values = np.full(len(bdofs), bc_values)
+        else:
+            bc_values = np.asarray(bc_values)
+            if len(bc_values) != len(bdofs):
+                raise ValueError("Length of bc['values'] must match length of bc['nodes']")
+    else:
+        # Use simple constant boundary value on all boundaries
         try:
-            bdofs = np.unique(mesh.facets.flatten())
+            bdofs = mesh.boundary_nodes()
         except Exception:
-            bdofs = np.array([], dtype=int)
-    bdofs = np.asarray(bdofs, dtype=int)
+            try:
+                bdofs = np.unique(mesh.facets.flatten())
+            except Exception:
+                bdofs = np.array([], dtype=int)
+        bdofs = np.asarray(bdofs, dtype=int)
+        bc_values = np.full(len(bdofs), bc_value)
+    
     all_idx = np.arange(basis.N)
     interior = np.setdiff1d(all_idx, bdofs)
 
     # Solve interior system with Dirichlet boundary conditions
     Aii = A[interior][:, interior]
-    bi = b[interior] - A[interior][:, bdofs].dot(np.full(bdofs.shape[0], bc_value))
-    phi = np.full(basis.N, bc_value, dtype=float)
+    bi = b[interior] - A[interior][:, bdofs].dot(bc_values)
+    
+    # Initialize solution with boundary values
+    phi = np.zeros(basis.N, dtype=float)
+    phi[bdofs] = bc_values
     phi_i = spla.spsolve(Aii, bi)
     phi[interior] = phi_i
     return phi

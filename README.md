@@ -15,6 +15,11 @@ Finite element solver for the Schrödinger-Poisson system with support for heter
   - Spatially varying scalar mass (array or callable)
   - Anisotropic effective mass tensor (3×3 tensor at each point)
   - Support for discontinuous mass fields at material interfaces
+- **Flexible boundary conditions**: Utility functions for defining BCs:
+  - By position (plane, bounding box)
+  - By custom functions
+  - Position-dependent values
+  - Combine multiple BC specifications
 - **DIIS acceleration**: Pulay mixing for faster SCF convergence
 - **3D tetrahedral meshes**: Using pygmsh/gmsh mesh generation
 
@@ -135,6 +140,49 @@ E, modes, phi, Vfinal = solver.scf_loop(
 )
 ```
 
+### Boundary Conditions
+
+Flexible boundary condition utilities for defining BCs by position, region, or custom functions:
+
+```python
+from src import boundary_conditions as bc_utils
+
+# Different values on opposite faces
+nodes_left = bc_utils.get_boundary_nodes_by_plane(basis, 'x', 0.0)
+nodes_right = bc_utils.get_boundary_nodes_by_plane(basis, 'x', 1.0)
+
+bc_left = bc_utils.create_dirichlet_bc(basis, value=0.0, nodes=nodes_left)
+bc_right = bc_utils.create_dirichlet_bc(basis, value=1.0, nodes=nodes_right)
+bc = bc_utils.combine_boundary_conditions([bc_left, bc_right])
+
+phi = solver.solve_poisson(mesh, basis, rho, bc=bc)
+
+# Position-dependent boundary values
+def bc_func(X):
+    return X[0] + X[1]  # phi = x + y on boundary
+
+bc = bc_utils.create_dirichlet_bc(basis, value=bc_func)
+phi = solver.solve_poisson(mesh, basis, rho, bc=bc)
+
+# Custom boundary regions
+def high_region(X):
+    return X[0] + X[1] + X[2] > 2.0
+
+nodes_high = bc_utils.get_boundary_nodes_by_function(basis, high_region)
+bc = bc_utils.create_dirichlet_bc(basis, value=1.0, nodes=nodes_high)
+phi = solver.solve_poisson(mesh, basis, rho, bc=bc)
+
+# Using bounding boxes
+nodes_corner = bc_utils.get_boundary_nodes_by_box(
+    basis, xmin=0.8, ymin=0.8, zmin=0.8
+)
+bc = bc_utils.create_dirichlet_bc(basis, value=1.0, nodes=nodes_corner)
+
+# Convenience functions
+bounds = bc_utils.get_domain_bounds(basis)
+x_faces = bc_utils.get_boundary_faces(basis, axis='x')
+```
+
 ### Heterostructure Interfaces
 
 Handle discontinuous material properties at interfaces:
@@ -213,11 +261,13 @@ E, modes, phi, Vfinal = solver.scf_loop(
 - `examples/demo_epsilon.py` - Poisson solver with various epsilon configurations
 - `examples/demo_visualization.py` - Visualization utilities showcase
 - `examples/demo_heterostructure.py` - Heterostructure interfaces with discontinuous ε and m_eff
+- `examples/demo_boundary_conditions.py` - Boundary condition utilities demonstration
 
 Run examples:
 
     PYTHONPATH=. python examples/demo_epsilon.py
     PYTHONPATH=. python examples/demo_heterostructure.py
+    PYTHONPATH=. python examples/demo_boundary_conditions.py
 
 ## Testing
 
