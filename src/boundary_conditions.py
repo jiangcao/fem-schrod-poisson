@@ -233,7 +233,15 @@ def create_dirichlet_bc(
     # Evaluate callable boundary values
     if callable(value):
         X = basis.doflocs[:, nodes]
-        bc_values = np.asarray(value(X)).reshape(-1)
+        bc_values = np.asarray(value(X))
+        # Validate shape
+        if bc_values.ndim != 1:
+            bc_values = bc_values.reshape(-1)
+        if len(bc_values) != len(nodes):
+            raise ValueError(
+                f"Callable boundary value function must return array of length {len(nodes)}, "
+                f"got {len(bc_values)}"
+            )
     else:
         bc_values = float(value)
     
@@ -273,9 +281,9 @@ def combine_boundary_conditions(
     if not bc_list:
         return {'nodes': np.array([], dtype=int), 'values': np.array([])}
     
-    # Collect all nodes and values
-    all_nodes = []
-    all_values = []
+    # Remove duplicates (keep last value for each node)
+    # Use dictionary for O(n) performance instead of O(n²) loop
+    node_to_value = {}
     
     for bc in bc_list:
         if bc['type'] != 'dirichlet':
@@ -288,27 +296,24 @@ def combine_boundary_conditions(
         if np.isscalar(values):
             values = np.full(len(nodes), values)
         
-        all_nodes.append(nodes)
-        all_values.append(values)
+        # Update dictionary (later values override earlier ones)
+        for node, val in zip(nodes, values):
+            node_to_value[int(node)] = val
     
-    # Concatenate
-    nodes_concat = np.concatenate(all_nodes)
-    values_concat = np.concatenate(all_values)
+    # Convert back to arrays
+    unique_nodes = np.array(list(node_to_value.keys()), dtype=int)
+    final_values = np.array(list(node_to_value.values()))
     
-    # Remove duplicates (keep last value for each node)
-    unique_nodes, inverse_indices = np.unique(nodes_concat, return_inverse=True)
-    final_values = np.zeros(len(unique_nodes))
-    
-    for i, node_idx in enumerate(nodes_concat):
-        unique_idx = inverse_indices[i]
-        final_values[unique_idx] = values_concat[i]
+    # Sort by node index for consistency
+    sort_idx = np.argsort(unique_nodes)
+    unique_nodes = unique_nodes[sort_idx]
+    final_values = final_values[sort_idx]
     
     return {
         'type': 'dirichlet',
         'nodes': unique_nodes,
         'values': final_values
     }
-
 
 def get_domain_bounds(basis: Basis) -> Dict[str, Tuple[float, float]]:
     """

@@ -9,6 +9,7 @@ This script shows different ways to specify boundary conditions:
 4. Complex boundary conditions using custom functions
 """
 
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from src import solver, boundary_conditions as bc_utils
@@ -18,6 +19,8 @@ def main():
     print("Boundary Condition Utilities - Examples")
     print("=" * 70)
     
+    # Ensure results directory exists
+    os.makedirs('results', exist_ok=True)
     # Create a test mesh
     print("\nCreating mesh...")
     mesh = solver.make_mesh_box(x0=(0, 0, 0), lengths=(1.0, 1.0, 1.0), 
