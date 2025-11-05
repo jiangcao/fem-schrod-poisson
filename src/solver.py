@@ -129,10 +129,21 @@ class DIIS:
 
 def scf_loop(mesh, basis, K, M, Vext_func, coupling=1.0, maxiter=50, tol=1e-6,
              mix=0.3, nev=4, verbose=True, use_diis=False, diis_max=6,
-             phys: PhysicalParams | None = None):
+             phys: PhysicalParams | None = None, epsilon=None, mass_eff=None):
     """
     Self-consistent loop with optional DIIS (use_diis=True).
     If DIIS is enabled, simple linear mixing is used for first iterations while DIIS accumulates.
+    
+    Parameters:
+    -----------
+    epsilon : None, scalar, array, or callable
+        Dielectric constant for Poisson equation (passed to solve_poisson)
+    mass_eff : None, scalar, array, or callable
+        Effective mass for Schrödinger equation (overrides phys.m_eff if provided)
+        - scalar: constant effective mass
+        - 1D array: spatially varying scalar mass at DOFs
+        - callable(X): returns scalar array (npts,) or tensor array (3,3,npts)
+    
     Returns E, modes, phi, V_final
     """
     ndofs = basis.N
@@ -142,10 +153,22 @@ def scf_loop(mesh, basis, K, M, Vext_func, coupling=1.0, maxiter=50, tol=1e-6,
     prev_energy = None
 
     diis = DIIS(max_vec=diis_max) if use_diis else None
-    kinetic_coeff = (phys.hbar ** 2) / (2.0 * phys.m_eff) if phys is not None else 0.5
+    
+    # Determine kinetic coefficient - note mass_eff parameter overrides phys.m_eff
+    if mass_eff is None:
+        kinetic_coeff = (phys.hbar ** 2) / (2.0 * phys.m_eff) if phys is not None else 0.5
+        mass_eff_param = None
+    else:
+        # mass_eff is provided, use it
+        kinetic_coeff = None  # Will be handled in solve_generalized_eig
+        mass_eff_param = mass_eff
 
     for it in range(1, maxiter + 1):
-        E, modes = solve_generalized_eig(K, M, V_old, nev=nev, which='SM', kinetic_coeff=kinetic_coeff, basis=basis, mesh=mesh, dirichlet_bc=False, Vfunc=Vext_func)
+        E, modes = solve_generalized_eig(K, M, V_old, nev=nev, which='SM', 
+                                        kinetic_coeff=kinetic_coeff, 
+                                        mass_eff=mass_eff_param,
+                                        phys=phys,
+                                        basis=basis, mesh=mesh, dirichlet_bc=False, Vfunc=Vext_func)
         modes = normalize_modes(modes, M)
         psi0 = modes[:, 0]
         # Convert to charge density if physical constants are provided
@@ -154,7 +177,7 @@ def scf_loop(mesh, basis, K, M, Vext_func, coupling=1.0, maxiter=50, tol=1e-6,
         else:
             rho = np.abs(psi0) ** 2
 
-        phi = solve_poisson(mesh, basis, rho, bc_value=0.0)
+        phi = solve_poisson(mesh, basis, rho, bc_value=0.0, epsilon=epsilon)
 
         if phys is not None:
             V_new = Vext_vec + coupling * (phys.q * phi)
@@ -218,23 +241,81 @@ def normalize_modes(modes: np.ndarray, M: sp.spmatrix) -> np.ndarray:
     return modes
 
 
+def _invert_mass_tensor_field(mass_tensor):
+    """
+    Invert a field of 3×3 mass tensors efficiently.
+    
+    Parameters:
+    -----------
+    mass_tensor : ndarray of shape (3, 3, npts)
+        Mass tensor at each point
+        
+    Returns:
+    --------
+    mass_inv : ndarray of shape (3, 3, npts)
+        Inverse mass tensor at each point
+    """
+    npts = mass_tensor.shape[2]
+    mass_inv = np.zeros_like(mass_tensor)
+    
+    # Check if tensor is diagonal at all points (common case)
+    is_diagonal = True
+    for i in range(3):
+        for j in range(3):
+            if i != j and np.max(np.abs(mass_tensor[i, j, :])) > 1e-12:
+                is_diagonal = False
+                break
+        if not is_diagonal:
+            break
+    
+    if is_diagonal:
+        # Optimized path for diagonal tensors - element-wise inversion
+        for i in range(3):
+            mass_inv[i, i, :] = 1.0 / mass_tensor[i, i, :]
+    else:
+        # General case - invert each matrix
+        for i in range(npts):
+            mass_inv[:, :, i] = np.linalg.inv(mass_tensor[:, :, i])
+    
+    return mass_inv
+
+
 def solve_generalized_eig(
     K: sp.spmatrix,
     M: sp.spmatrix,
     V: np.ndarray,
     nev=4,
     which='SM',
-    kinetic_coeff: float = 0.5,
+    kinetic_coeff: float | None = 0.5,
     basis: Basis | None = None,
     mesh: MeshTet | None = None,
     dirichlet_bc: bool = True,
     Vfunc=None,
+    mass_eff=None,
+    phys: PhysicalParams | None = None,
 ):
     """
-    Solve the generalized eigenproblem:
-        ( -kinetic_coeff * K + V_M ) psi = E M psi
-    where V_M is the potential operator assembled as a weighted mass matrix
-    using the nodal potential values V.
+    Solve the generalized eigenproblem for Schrödinger equation with spatially varying mass.
+    
+    The equation is:
+        -∇·(1/m_eff ∇ψ) + V ψ = E ψ   (with proper scaling by ħ²/2)
+    
+    or in tensor form:
+        -∇·(1/m_eff_tensor ∇ψ) + V ψ = E ψ
+    
+    Parameters:
+    -----------
+    kinetic_coeff : float or None
+        If mass_eff is None, this is used as the kinetic coefficient (ħ²/2m)
+    mass_eff : None, scalar, array, or callable
+        Effective mass specification:
+        - None: use kinetic_coeff
+        - scalar: constant effective mass
+        - 1D array of length ndofs: scalar mass at DOFs
+        - callable(X): returns scalar array (npts,) or tensor array (3,3,npts)
+        - 3D array of shape (ndofs,3,3): tensor mass at DOFs
+    phys : PhysicalParams or None
+        Physical parameters (used for hbar when mass_eff is provided)
     """
     if sp.issparse(K):
         K = K.tocsr()
@@ -245,7 +326,6 @@ def solve_generalized_eig(
     if V.shape[0] != n:
         raise ValueError("Dimension mismatch for potential vector V")
 
-    # Assemble weighted mass matrix for potential term
     # Assemble potential operator
     if Vfunc is not None and basis is not None:
         @BilinearForm
@@ -258,7 +338,101 @@ def solve_generalized_eig(
         # Fallback to diagonal potential
         V_M = sp.diags(V)
 
-    H = (kinetic_coeff) * K + V_M
+    # Assemble kinetic operator with spatially varying mass
+    if mass_eff is None:
+        # Use standard laplacian with constant kinetic coefficient
+        K_eff = (kinetic_coeff if kinetic_coeff is not None else 0.5) * K
+    else:
+        # Assemble kinetic operator with spatially varying effective mass
+        # The operator is -∇·(c/m_eff ∇ψ) where c = ħ²/2
+        hbar = phys.hbar if phys is not None else 1.0
+        c_coeff = (hbar ** 2) / 2.0
+        
+        if basis is None:
+            raise ValueError("basis is required when mass_eff is specified")
+        
+        if callable(mass_eff):
+            # Evaluate at quadrature points
+            def is_tensor(m_samp):
+                arr = np.asarray(m_samp)
+                return arr.ndim == 3 and arr.shape[0] == 3 and arr.shape[1] == 3
+            
+            @BilinearForm
+            def kinetic_form(u, v, w):
+                X_flat = w.x.reshape(3, -1)
+                m_val = mass_eff(X_flat)
+                m_arr = np.asarray(m_val)
+                shape_qp = u.grad[0].shape
+                
+                if is_tensor(m_arr):
+                    # Tensor mass: use helper function to invert efficiently
+                    # m_arr has shape (3, 3, npts)
+                    m_inv = _invert_mass_tensor_field(m_arr)
+                    
+                    # Assemble -c ∇·(m_inv ∇ψ)
+                    res = 0.0
+                    for i in range(3):
+                        for j in range(3):
+                            m_inv_qp = m_inv[i, j, :].reshape(shape_qp)
+                            res = res + c_coeff * m_inv_qp * u.grad[j] * v.grad[i]
+                    return res
+                else:
+                    # Scalar mass
+                    m_qp = m_arr.reshape(shape_qp)
+                    return c_coeff * (1.0 / m_qp) * (
+                        u.grad[0] * v.grad[0] + u.grad[1] * v.grad[1] + u.grad[2] * v.grad[2]
+                    )
+            
+            K_eff = asm(kinetic_form, basis).tocsr()
+            
+        elif isinstance(mass_eff, np.ndarray):
+            m_arr = np.asarray(mass_eff)
+            if m_arr.ndim == 1:
+                # Scalar mass at DOFs
+                if m_arr.shape[0] != basis.N:
+                    raise ValueError("mass_eff array length must match number of DOFs")
+                m_qp = basis.interpolate(m_arr)
+                
+                @BilinearForm
+                def kinetic_form(u, v, w):
+                    return c_coeff * (1.0 / m_qp) * (
+                        u.grad[0] * v.grad[0] + u.grad[1] * v.grad[1] + u.grad[2] * v.grad[2]
+                    )
+                
+                K_eff = asm(kinetic_form, basis).tocsr()
+                
+            elif m_arr.ndim == 3 and m_arr.shape[0] == basis.N and m_arr.shape[1:] == (3, 3):
+                # Tensor mass at DOFs - interpolate and invert
+                m_qp = np.zeros((3, 3) + basis.interpolate(m_arr[:, 0, 0]).shape)
+                for i in range(3):
+                    for j in range(3):
+                        m_qp[i, j] = basis.interpolate(m_arr[:, i, j])
+                
+                # Use helper function to invert efficiently
+                shape_qp = m_qp[0, 0].shape
+                npts = np.prod(shape_qp)
+                m_qp_flat = m_qp.reshape(3, 3, npts)
+                m_inv_flat = _invert_mass_tensor_field(m_qp_flat)
+                m_inv_qp = m_inv_flat.reshape((3, 3) + shape_qp)
+                
+                @BilinearForm
+                def kinetic_form(u, v, w):
+                    res = 0.0
+                    for i in range(3):
+                        for j in range(3):
+                            res = res + c_coeff * m_inv_qp[i, j] * u.grad[j] * v.grad[i]
+                    return res
+                
+                K_eff = asm(kinetic_form, basis).tocsr()
+            else:
+                raise ValueError("Unsupported mass_eff array shape")
+        elif np.isscalar(mass_eff):
+            # Constant scalar mass
+            K_eff = c_coeff * (1.0 / float(mass_eff)) * K
+        else:
+            raise TypeError("mass_eff must be None, scalar, array, or callable")
+
+    H = K_eff + V_M
 
     # Apply Dirichlet boundary conditions by restricting to interior DOFs if requested
     if dirichlet_bc and mesh is not None:

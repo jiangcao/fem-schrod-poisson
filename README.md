@@ -1,14 +1,20 @@
 # fem-schrod-poisson
 
-Finite element solver for the Schrödinger-Poisson system with support for spatially varying permittivity.
+Finite element solver for the Schrödinger-Poisson system with support for heterostructure interfaces, spatially varying permittivity, and anisotropic effective mass.
 
 ## Features
 
 - **Schrödinger-Poisson solver**: Self-consistent solution of coupled quantum-classical system
+- **Heterostructure interface support**: Handles discontinuous ε and effective mass with proper flux continuity
 - **Poisson solver with spatially varying epsilon**: Solves `-∇·(ε∇φ) = ρ` with flexible epsilon specification:
   - Constant scalar epsilon
   - Spatially varying scalar epsilon (array or callable)
   - Spatially varying tensor epsilon (anisotropic materials)
+- **Schrödinger solver with spatially varying effective mass**: Solves `-∇·(1/m_eff ∇ψ) + Vψ = Eψ`:
+  - Constant scalar mass
+  - Spatially varying scalar mass (array or callable)
+  - Anisotropic effective mass tensor (3×3 tensor at each point)
+  - Support for discontinuous mass fields at material interfaces
 - **DIIS acceleration**: Pulay mixing for faster SCF convergence
 - **3D tetrahedral meshes**: Using pygmsh/gmsh mesh generation
 
@@ -82,6 +88,80 @@ def epsilon_anisotropic(X):
 phi = solver.solve_poisson(mesh, basis, rho, epsilon=epsilon_anisotropic)
 ```
 
+### Spatially Varying Effective Mass
+
+```python
+# Constant scalar mass
+mass_eff = 0.5
+E, modes, phi, Vfinal = solver.scf_loop(
+    mesh, basis, K, M, Vext,
+    mass_eff=mass_eff, phys=phys
+)
+
+# Spatially varying scalar mass (as array at DOFs)
+X = basis.doflocs
+mass_eff = 0.5 + 0.5 * X[0, :]  # varies along x-axis
+E, modes, phi, Vfinal = solver.scf_loop(
+    mesh, basis, K, M, Vext,
+    mass_eff=mass_eff, phys=phys
+)
+
+# Spatially varying scalar mass (as callable)
+def mass_func(X):
+    r2 = X[0]**2 + X[1]**2 + X[2]**2
+    return 0.5 + 0.5 * r2
+
+E, modes, phi, Vfinal = solver.scf_loop(
+    mesh, basis, K, M, Vext,
+    mass_eff=mass_func, phys=phys
+)
+```
+
+### Anisotropic Effective Mass Tensor
+
+```python
+# Diagonal tensor (different mass in each direction)
+def mass_tensor(X):
+    npts = X.shape[1]
+    m = np.zeros((3, 3, npts))
+    m[0, 0, :] = 1.0  # mx
+    m[1, 1, :] = 2.0  # my
+    m[2, 2, :] = 0.5  # mz
+    return m
+
+E, modes, phi, Vfinal = solver.scf_loop(
+    mesh, basis, K, M, Vext,
+    mass_eff=mass_tensor, phys=phys
+)
+```
+
+### Heterostructure Interfaces
+
+Handle discontinuous material properties at interfaces:
+
+```python
+# Define heterostructure with step discontinuity at x=1.0
+def epsilon_func(X):
+    """Material 1: ε=1.0, Material 2: ε=3.0"""
+    eps = np.ones(X.shape[1])
+    eps[X[0, :] > 1.0] = 3.0
+    return eps
+
+def mass_func(X):
+    """Material 1: m=1.0, Material 2: m=0.5"""
+    m = np.ones(X.shape[1])
+    m[X[0, :] > 1.0] = 0.5
+    return m
+
+# Solver handles flux continuity automatically
+E, modes, phi, Vfinal = solver.scf_loop(
+    mesh, basis, K, M, Vext,
+    epsilon=epsilon_func,
+    mass_eff=mass_func,
+    phys=phys
+)
+```
+
 ### Schrödinger-Poisson SCF Loop
 
 ```python
@@ -130,13 +210,14 @@ E, modes, phi, Vfinal = solver.scf_loop(
 
 ## Examples
 
-    - `examples/demo_epsilon.py` - Poisson solver with various epsilon configurations
-    - `examples/demo_visualization.py` - Visualization utilities showcase
-    - `examples/demo_heterostructure.py` - Heterostructure with spatially varying epsilon
+- `examples/demo_epsilon.py` - Poisson solver with various epsilon configurations
+- `examples/demo_visualization.py` - Visualization utilities showcase
+- `examples/demo_heterostructure.py` - Heterostructure interfaces with discontinuous ε and m_eff
 
 Run examples:
 
     PYTHONPATH=. python examples/demo_epsilon.py
+    PYTHONPATH=. python examples/demo_heterostructure.py
 
 ## Testing
 
